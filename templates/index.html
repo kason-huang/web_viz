@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Episode Visualizer — {{ info.dataset_name }}</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;display:flex;height:100vh;color:#333;font-size:14px}
+
+/* sidebar */
+.sidebar{width:240px;min-width:240px;background:#f6f8fa;border-right:1px solid #d0d7de;display:flex;flex-direction:column}
+.sidebar-header{padding:12px 14px;font-weight:600;font-size:13px;background:#eaeef2;border-bottom:1px solid #d0d7de}
+.episode-list{flex:1;overflow-y:auto}
+.episode-item{padding:7px 14px;cursor:pointer;border-bottom:1px solid #eee;font-size:13px;display:flex;justify-content:space-between}
+.episode-item:hover{background:#e0e4e8}
+.episode-item.active{background:#ddf4ff;font-weight:500}
+.episode-num{color:#555}
+.episode-task{color:#888;font-size:11px;max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* main */
+.main{flex:1;display:flex;flex-direction:column;padding:12px 16px;overflow-y:auto;min-width:0}
+.info-bar{font-size:12px;color:#666;margin-bottom:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* camera grid */
+.camera-grid{display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap}
+.cam-box{border:1px solid #d0d7de;border-radius:4px;overflow:hidden;background:#fafbfc}
+.cam-box img{display:block;max-height:220px;width:auto}
+.cam-label{font-size:11px;color:#555;padding:2px 6px;background:#f0f2f4;border-bottom:1px solid #d0d7de}
+.placeholder-cam{padding:60px 80px;color:#999;font-size:13px;text-align:center;border:1px dashed #ccc;border-radius:4px}
+
+/* controls */
+.controls{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.controls button{width:32px;height:28px;font-size:14px;cursor:pointer;border:1px solid #d0d7de;border-radius:4px;background:#f6f8fa}
+.controls button:hover{background:#eaeef2}
+.controls input[type=range]{flex:1;height:4px;accent-color:#0969da}
+.controls .frame-label{font-size:12px;color:#555;min-width:80px;text-align:right;user-select:none}
+.controls .speed-label{font-size:11px;color:#888;display:flex;align-items:center;gap:4px}
+.controls .speed-label select{font-size:11px;padding:1px 2px}
+
+/* dim selector */
+.dim-selector{display:flex;flex-wrap:wrap;gap:2px 14px;padding:6px 0;font-size:12px;border-top:1px solid #eee;margin-top:4px}
+.dim-selector label{cursor:pointer;display:flex;align-items:center;gap:3px}
+.dim-selector input[type=checkbox]{accent-color:#0969da}
+.dim-selector .dim-color{width:8px;height:8px;border-radius:2px;display:inline-block}
+
+/* chart */
+#state-chart{flex:1;min-height:260px;width:100%}
+
+/* no-selection */
+.no-ep{display:flex;flex:1;align-items:center;justify-content:center;color:#999;font-size:15px}
+</style>
+</head>
+<body>
+
+<div class="sidebar">
+  <div class="sidebar-header">Episodes ({{ info.total_episodes }})</div>
+  <div class="episode-list" id="episode-list"></div>
+</div>
+
+<div class="main">
+  <div class="info-bar" id="info-bar"></div>
+  <div class="camera-grid" id="camera-grid"></div>
+  <div class="controls" id="controls" style="display:none">
+    <button id="play-btn">▶</button>
+    <input type="range" id="frame-slider" min="0" value="0">
+    <span class="frame-label" id="frame-label">0 / 0</span>
+    <span class="speed-label">
+      FPS <select id="speed-select">
+        <option value="5">5</option>
+        <option value="10">10</option>
+        <option value="15">15</option>
+        <option value="20">20</option>
+        <option value="30" selected>{{ info.fps }}</option>
+        <option value="60">60</option>
+      </select>
+    </span>
+  </div>
+  <div class="dim-selector" id="dim-selector" style="display:none"></div>
+  <div id="state-chart"></div>
+  <div class="no-ep" id="no-ep">Select an episode from the sidebar</div>
+</div>
+
+<script>
+// ── Config ──
+const CAMERA_KEYS = {{ info.camera_keys | tojson }};
+const STATE_NAMES = {{ info.state_names | tojson }};
+const FPS = {{ info.fps }};
+
+// ── State ──
+let chart = null;
+let allStates = [];
+let allActions = [];
+let dimNames = [];
+let currentFrame = 0;
+let totalFrames = 0;
+let isPlaying = false;
+let playTimer = null;
+let selectedDims = null;      // Set of indices
+let currentEpisode = null;
+const CAM_COLORS = ['#0969da','#cf222e','#1a7f37','#8250df','#d29922','#656d76'];
+
+// ── DOM refs ──
+const episodeList = document.getElementById('episode-list');
+const cameraGrid = document.getElementById('camera-grid');
+const frameSlider = document.getElementById('frame-slider');
+const frameLabel = document.getElementById('frame-label');
+const playBtn = document.getElementById('play-btn');
+const speedSelect = document.getElementById('speed-select');
+const dimSelector = document.getElementById('dim-selector');
+const controls = document.getElementById('controls');
+const chartDom = document.getElementById('state-chart');
+const noEp = document.getElementById('no-ep');
+const infoBar = document.getElementById('info-bar');
+
+// ── Init ──
+fetch('/api/episodes')
+  .then(r => r.json())
+  .then(episodes => {
+    episodes.forEach(ep => {
+      const div = document.createElement('div');
+      div.className = 'episode-item';
+      div.dataset.ep = ep.episode;
+      div.innerHTML = `<span class="episode-num">#${ep.episode}</span><span class="episode-task">${ep.task}</span>`;
+      div.onclick = () => loadEpisode(ep.episode);
+      episodeList.appendChild(div);
+    });
+    if (episodes.length > 0) loadEpisode(0);
+  });
+
+function cameraLabel(key) {
+  const parts = key.split('.');
+  return parts[parts.length - 1];
+}
+
+function loadEpisode(ep) {
+  // highlight sidebar
+  document.querySelectorAll('.episode-item').forEach(el => el.classList.remove('active'));
+  const el = document.querySelector(`.episode-item[data-ep="${ep}"]`);
+  if (el) el.classList.add('active');
+
+  if (isPlaying) togglePlay();
+  currentEpisode = ep;
+  noEp.style.display = 'none';
+  chartDom.style.display = 'block';
+  controls.style.display = 'flex';
+  dimSelector.style.display = 'flex';
+
+  fetch(`/api/episode/${ep}`)
+    .then(r => r.json())
+    .then(data => {
+      allStates = data.states;
+      allActions = data.actions;
+      dimNames = data.state_names.length ? data.state_names : STATE_NAMES;
+      totalFrames = data.num_frames;
+
+      // default: no dims selected, user checks what they want
+      selectedDims = new Set();
+
+      // slider
+      frameSlider.max = Math.max(0, totalFrames - 1);
+      frameSlider.value = 0;
+      frameLabel.textContent = `0 / ${totalFrames - 1}`;
+
+      renderDimSelector();
+      renderChart();
+      updateFrame(0);
+    });
+}
+
+function renderDimSelector() {
+  dimSelector.innerHTML = '';
+  dimNames.forEach((name, i) => {
+    const label = document.createElement('label');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = false;
+    cb.dataset.idx = i;
+    cb.onchange = () => {
+      if (cb.checked) selectedDims.add(i);
+      else selectedDims.delete(i);
+      renderChart();  // also calls updateCursor internally
+    };
+    const dot = document.createElement('span');
+    dot.className = 'dim-color';
+    dot.style.background = CAM_COLORS[i % CAM_COLORS.length];
+    label.appendChild(dot);
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode(name));
+    dimSelector.appendChild(label);
+  });
+}
+
+function renderChart() {
+  if (chart) chart.dispose();
+  chart = echarts.init(chartDom);
+
+  const series = [];
+  dimNames.forEach((name, i) => {
+    if (!selectedDims.has(i)) return;
+    series.push({
+      id: `s_${i}`,
+      name,
+      type: 'line',
+      data: allStates.map(s => +s[i].toFixed(4)),
+      smooth: true,
+      symbol: 'none',
+      lineStyle: { width: 1.5, color: CAM_COLORS[i % CAM_COLORS.length] },
+      emphasis: { lineStyle: { width: 2.5 } },
+    });
+  });
+
+  chart.setOption({
+    tooltip: {
+      trigger: 'axis',
+      confine: true,
+      textStyle: { fontSize: 12 },
+    },
+    legend: {
+      type: 'scroll',
+      top: 0,
+      textStyle: { fontSize: 11 },
+      pageIconSize: 10,
+    },
+    grid: { left: 45, right: 16, top: 36, bottom: 24 },
+    xAxis: {
+      type: 'category',
+      axisLine: { lineStyle: { color: '#d0d7de' } },
+      axisLabel: { fontSize: 10, color: '#666' },
+    },
+    yAxis: {
+      type: 'value',
+      scale: true,
+      splitLine: { lineStyle: { color: '#eee', type: 'dashed' } },
+      axisLabel: { fontSize: 10, color: '#666' },
+    },
+    series,
+  }, true);  // notMerge — replace entirely on re-render
+
+  if (currentFrame >= 0 && currentFrame < totalFrames) {
+    updateCursor(currentFrame);
+  }
+
+  chart.on('click', function (params) {
+    if (params.dataIndex != null) {
+      updateFrame(params.dataIndex);
+    }
+  });
+}
+
+function updateCursor(frameIdx) {
+  if (!chart) return;
+  const updates = [];
+  dimNames.forEach((name, i) => {
+    if (!selectedDims.has(i)) return;
+    updates.push({
+      id: `s_${i}`,
+      markLine: {
+        silent: true,
+        symbol: 'none',
+        lineStyle: { color: '#ff4444', width: 1.5, type: 'dashed' },
+        data: [{ xAxis: frameIdx }],
+        label: { show: false },
+      },
+    });
+  });
+  chart.setOption({ series: updates });
+}
+
+function updateFrame(frameIdx) {
+  if (frameIdx < 0 || frameIdx >= totalFrames) return;
+  currentFrame = frameIdx;
+
+  frameSlider.value = frameIdx;
+  frameLabel.textContent = `${frameIdx} / ${totalFrames - 1}`;
+
+  // cameras
+  cameraGrid.innerHTML = '';
+  if (CAMERA_KEYS.length === 0) {
+    cameraGrid.innerHTML = '<div class="placeholder-cam">No camera data</div>';
+  } else {
+    CAMERA_KEYS.forEach(cam => {
+      const box = document.createElement('div');
+      box.className = 'cam-box';
+      const label = document.createElement('div');
+      label.className = 'cam-label';
+      label.textContent = cameraLabel(cam);
+      box.appendChild(label);
+      const img = document.createElement('img');
+      img.src = `/api/frame/${currentEpisode}/${frameIdx}?camera=${cam}&t=${Date.now()}`;
+      img.alt = cam;
+      box.appendChild(img);
+      cameraGrid.appendChild(box);
+    });
+  }
+
+  // chart cursor
+  updateCursor(frameIdx);
+}
+
+// ── Slider ──
+frameSlider.addEventListener('input', function () {
+  if (isPlaying) togglePlay();
+  updateFrame(parseInt(this.value));
+});
+
+// ── Play / pause ──
+function togglePlay() {
+  isPlaying = !isPlaying;
+  playBtn.textContent = isPlaying ? '⏸' : '▶';
+  if (isPlaying) {
+    const speed = parseInt(speedSelect.value);
+    playTimer = setInterval(() => {
+      let next = currentFrame + 1;
+      if (next >= totalFrames) next = 0;
+      updateFrame(next);
+      // sync slider
+      frameSlider.value = next;
+    }, Math.round(1000 / speed));
+  } else {
+    clearInterval(playTimer);
+    playTimer = null;
+  }
+}
+playBtn.addEventListener('click', togglePlay);
+
+// stop playback when speed changes during play
+speedSelect.addEventListener('change', () => {
+  if (isPlaying) {
+    clearInterval(playTimer);
+    const speed = parseInt(speedSelect.value);
+    playTimer = setInterval(() => {
+      let next = currentFrame + 1;
+      if (next >= totalFrames) next = 0;
+      updateFrame(next);
+      frameSlider.value = next;
+    }, Math.round(1000 / speed));
+  }
+});
+
+// ── Keyboard shortcuts ──
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'SELECT') return;
+  if (e.key === ' ' || e.key === 'Space') { e.preventDefault(); togglePlay(); }
+  if (e.key === 'ArrowRight') { e.preventDefault(); updateFrame(Math.min(currentFrame + 1, totalFrames - 1)); }
+  if (e.key === 'ArrowLeft') { e.preventDefault(); updateFrame(Math.max(currentFrame - 1, 0)); }
+});
+
+// ── Resize ──
+window.addEventListener('resize', () => { if (chart) chart.resize(); });
+</script>
+</body>
+</html>
