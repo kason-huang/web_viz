@@ -59,7 +59,7 @@ def _load_raw_info(dataset_path):
 
 
 def build_app(dataset_path, max_episodes=None):
-    ds = LeRobotDataset(dataset_path, video_backend="pyav")
+    ds = LeRobotDataset("local", root=str(dataset_path), video_backend="pyav")
     ep_bounds = _build_episode_bounds(ds, max_episodes)
     total_episodes = ds.num_episodes
     raw_info = _load_raw_info(dataset_path)
