@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Episode Visualizer — {{ info.dataset_name }}</title>
+<title>Episode Visualizer</title>
 <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -10,17 +10,20 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;d
 
 /* sidebar */
 .sidebar{width:240px;min-width:240px;background:#f6f8fa;border-right:1px solid #d0d7de;display:flex;flex-direction:column}
-.sidebar-header{padding:12px 14px;font-weight:600;font-size:13px;background:#eaeef2;border-bottom:1px solid #d0d7de}
+.sidebar-header{padding:10px 14px;font-size:12px;background:#eaeef2;border-bottom:1px solid #d0d7de}
+.sidebar-header select{width:100%;margin-top:4px;padding:3px 4px;font-size:13px;border:1px solid #d0d7de;border-radius:4px;background:#fff}
 .episode-list{flex:1;overflow-y:auto}
 .episode-item{padding:7px 14px;cursor:pointer;border-bottom:1px solid #eee;font-size:13px;display:flex;justify-content:space-between}
 .episode-item:hover{background:#e0e4e8}
 .episode-item.active{background:#ddf4ff;font-weight:500}
 .episode-num{color:#555}
 .episode-task{color:#888;font-size:11px;max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sidebar-loading{padding:20px;text-align:center;color:#999;font-size:13px}
 
 /* main */
 .main{flex:1;display:flex;flex-direction:column;padding:12px 16px;overflow-y:auto;min-width:0}
 .info-bar{font-size:12px;color:#666;margin-bottom:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.info-bar .ds-name{font-weight:500;color:#333}
 
 /* camera grid */
 .camera-grid{display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap}
@@ -47,20 +50,36 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;d
 /* chart */
 #state-chart{flex:1;min-height:260px;width:100%}
 
-/* no-selection */
+/* no-selection / loading */
 .no-ep{display:flex;flex:1;align-items:center;justify-content:center;color:#999;font-size:15px}
+.loading-overlay{display:flex;flex:1;align-items:center;justify-content:center;color:#999;font-size:15px;flex-direction:column;gap:8px}
+.loading-overlay .spinner{width:24px;height:24px;border:3px solid #e0e4e8;border-top-color:#0969da;border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
 </style>
 </head>
 <body>
 
 <div class="sidebar">
-  <div class="sidebar-header">Episodes ({{ info.total_episodes }})</div>
-  <div class="episode-list" id="episode-list"></div>
+  <div class="sidebar-header">
+    Dataset
+    <select id="dataset-select">
+      {% for ds in datasets %}
+      <option value="{{ ds.idx }}">{{ ds.name }}</option>
+      {% endfor %}
+    </select>
+    <div style="margin-top:6px;color:#555" id="episode-count"></div>
+  </div>
+  <div class="sidebar-loading" id="sidebar-loading">Loading...</div>
+  <div class="episode-list" id="episode-list" style="display:none"></div>
 </div>
 
 <div class="main">
   <div class="info-bar" id="info-bar"></div>
-  <div class="camera-grid" id="camera-grid"></div>
+  <div class="loading-overlay" id="loading-overlay">
+    <div class="spinner"></div>
+    <span>Loading dataset...</span>
+  </div>
+  <div class="camera-grid" id="camera-grid" style="display:none"></div>
   <div class="controls" id="controls" style="display:none">
     <button id="play-btn">▶</button>
     <input type="range" id="frame-slider" min="0" value="0">
@@ -71,7 +90,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;d
         <option value="10">10</option>
         <option value="15">15</option>
         <option value="20">20</option>
-        <option value="30" selected>{{ info.fps }}</option>
+        <option value="30" selected>30</option>
         <option value="60">60</option>
       </select>
     </span>
@@ -82,12 +101,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;d
 </div>
 
 <script>
-// ── Config ──
-const CAMERA_KEYS = {{ info.camera_keys | tojson }};
-const STATE_NAMES = {{ info.state_names | tojson }};
-const FPS = {{ info.fps }};
-
 // ── State ──
+let currentDs = {{ datasets[0].idx if datasets else 0 }};
 let chart = null;
 let allStates = [];
 let allActions = [];
@@ -96,12 +111,18 @@ let currentFrame = 0;
 let totalFrames = 0;
 let isPlaying = false;
 let playTimer = null;
-let selectedDims = null;      // Set of indices
+let selectedDims = null;
 let currentEpisode = null;
+let CAMERA_KEYS = [];
+let FPS = 30;
+let STATE_NAMES = [];
 const CAM_COLORS = ['#0969da','#cf222e','#1a7f37','#8250df','#d29922','#656d76'];
 
 // ── DOM refs ──
+const datasetSelect = document.getElementById('dataset-select');
+const episodeCount = document.getElementById('episode-count');
 const episodeList = document.getElementById('episode-list');
+const sidebarLoading = document.getElementById('sidebar-loading');
 const cameraGrid = document.getElementById('camera-grid');
 const frameSlider = document.getElementById('frame-slider');
 const frameLabel = document.getElementById('frame-label');
@@ -112,41 +133,84 @@ const controls = document.getElementById('controls');
 const chartDom = document.getElementById('state-chart');
 const noEp = document.getElementById('no-ep');
 const infoBar = document.getElementById('info-bar');
+const loadingOverlay = document.getElementById('loading-overlay');
 
-// ── Init ──
-fetch('/api/episodes')
-  .then(r => r.json())
-  .then(episodes => {
-    episodes.forEach(ep => {
-      const div = document.createElement('div');
-      div.className = 'episode-item';
-      div.dataset.ep = ep.episode;
-      div.innerHTML = `<span class="episode-num">#${ep.episode}</span><span class="episode-task">${ep.task}</span>`;
-      div.onclick = () => loadEpisode(ep.episode);
-      episodeList.appendChild(div);
+// ── Load dataset ──
+function loadDataset(dsIdx) {
+  loadingOverlay.style.display = 'flex';
+  noEp.style.display = 'none';
+  chartDom.style.display = 'none';
+  controls.style.display = 'none';
+  dimSelector.style.display = 'none';
+  cameraGrid.style.display = 'none';
+  episodeList.style.display = 'none';
+  sidebarLoading.style.display = 'block';
+  episodeCount.textContent = '';
+  infoBar.textContent = '';
+
+  if (isPlaying) togglePlay();
+  currentEpisode = null;
+  if (chart) { chart.dispose(); chart = null; }
+
+  const url = `/api/info?ds=${dsIdx}`;
+  fetch(url)
+    .then(r => r.json())
+    .then(info => {
+      CAMERA_KEYS = info.camera_keys || [];
+      FPS = info.fps || 30;
+      STATE_NAMES = info.state_names || [];
+      const loaded = info.loaded_episodes || 0;
+      const total = info.total_episodes || 0;
+      const suffix = total > loaded ? ` (showing first ${loaded})` : '';
+      episodeCount.textContent = `Episodes: ${total}${suffix}`;
+      infoBar.innerHTML = `Visualizing: <span class="ds-name">${info.dataset_name}</span> &mdash; ${info.robot_type} @ ${info.fps}fps`;
+
+      // Set FPS default
+      const fpsOpt = speedSelect.querySelector(`option[value="${FPS}"]`);
+      if (fpsOpt) fpsOpt.selected = true;
+
+      return fetch(`/api/episodes?ds=${dsIdx}`);
+    })
+    .then(r => r.json())
+    .then(episodes => {
+      episodeList.innerHTML = '';
+      episodes.forEach(ep => {
+        const div = document.createElement('div');
+        div.className = 'episode-item';
+        div.dataset.ep = ep.episode;
+        div.innerHTML = `<span class="episode-num">#${ep.episode}</span><span class="episode-task">${ep.task}</span>`;
+        div.onclick = () => loadEpisode(ep.episode);
+        episodeList.appendChild(div);
+      });
+
+      sidebarLoading.style.display = 'none';
+      episodeList.style.display = 'block';
+      loadingOverlay.style.display = 'none';
+      noEp.style.display = 'flex';
+
+      if (episodes.length > 0) loadEpisode(0, dsIdx);
     });
-    if (episodes.length > 0) loadEpisode(0);
-  });
-
-function cameraLabel(key) {
-  const parts = key.split('.');
-  return parts[parts.length - 1];
 }
 
-function loadEpisode(ep) {
-  // highlight sidebar
+// ── Dataset selector ──
+datasetSelect.addEventListener('change', function () {
+  const idx = parseInt(this.value);
+  currentDs = idx;
+  loadDataset(idx);
+});
+
+// ── Load episode ──
+function loadEpisode(ep, dsIdx) {
+  dsIdx = dsIdx !== undefined ? dsIdx : currentDs;
   document.querySelectorAll('.episode-item').forEach(el => el.classList.remove('active'));
   const el = document.querySelector(`.episode-item[data-ep="${ep}"]`);
   if (el) el.classList.add('active');
 
   if (isPlaying) togglePlay();
   currentEpisode = ep;
-  noEp.style.display = 'none';
-  chartDom.style.display = 'block';
-  controls.style.display = 'flex';
-  dimSelector.style.display = 'flex';
 
-  fetch(`/api/episode/${ep}`)
+  const url = `/api/episode/${ep}?ds=${dsIdx}`;
+  fetch(url)
     .then(r => r.json())
     .then(data => {
       allStates = data.states;
@@ -154,18 +218,28 @@ function loadEpisode(ep) {
       dimNames = data.state_names.length ? data.state_names : STATE_NAMES;
       totalFrames = data.num_frames;
 
-      // default: no dims selected, user checks what they want
       selectedDims = new Set();
+      dimNames.forEach((name, i) => { if (/gripper/i.test(name)) selectedDims.add(i); });
 
-      // slider
       frameSlider.max = Math.max(0, totalFrames - 1);
       frameSlider.value = 0;
       frameLabel.textContent = `0 / ${totalFrames - 1}`;
+
+      noEp.style.display = 'none';
+      chartDom.style.display = 'block';
+      controls.style.display = 'flex';
+      dimSelector.style.display = 'flex';
+      cameraGrid.style.display = 'flex';
 
       renderDimSelector();
       renderChart();
       updateFrame(0);
     });
+}
+
+function cameraLabel(key) {
+  const parts = key.split('.');
+  return parts[parts.length - 1];
 }
 
 function renderDimSelector() {
@@ -174,12 +248,12 @@ function renderDimSelector() {
     const label = document.createElement('label');
     const cb = document.createElement('input');
     cb.type = 'checkbox';
-    cb.checked = false;
+    cb.checked = selectedDims.has(i);
     cb.dataset.idx = i;
     cb.onchange = () => {
       if (cb.checked) selectedDims.add(i);
       else selectedDims.delete(i);
-      renderChart();  // also calls updateCursor internally
+      renderChart();
     };
     const dot = document.createElement('span');
     dot.className = 'dim-color';
@@ -211,40 +285,18 @@ function renderChart() {
   });
 
   chart.setOption({
-    tooltip: {
-      trigger: 'axis',
-      confine: true,
-      textStyle: { fontSize: 12 },
-    },
-    legend: {
-      type: 'scroll',
-      top: 0,
-      textStyle: { fontSize: 11 },
-      pageIconSize: 10,
-    },
+    tooltip: { trigger: 'axis', confine: true, textStyle: { fontSize: 12 } },
+    legend: { type: 'scroll', top: 0, textStyle: { fontSize: 11 }, pageIconSize: 10 },
     grid: { left: 45, right: 16, top: 36, bottom: 24 },
-    xAxis: {
-      type: 'category',
-      axisLine: { lineStyle: { color: '#d0d7de' } },
-      axisLabel: { fontSize: 10, color: '#666' },
-    },
-    yAxis: {
-      type: 'value',
-      scale: true,
-      splitLine: { lineStyle: { color: '#eee', type: 'dashed' } },
-      axisLabel: { fontSize: 10, color: '#666' },
-    },
+    xAxis: { type: 'category', axisLine: { lineStyle: { color: '#d0d7de' } }, axisLabel: { fontSize: 10, color: '#666' } },
+    yAxis: { type: 'value', scale: true, splitLine: { lineStyle: { color: '#eee', type: 'dashed' } }, axisLabel: { fontSize: 10, color: '#666' } },
     series,
-  }, true);  // notMerge — replace entirely on re-render
+  }, true);
 
-  if (currentFrame >= 0 && currentFrame < totalFrames) {
-    updateCursor(currentFrame);
-  }
+  if (currentFrame >= 0 && currentFrame < totalFrames) updateCursor(currentFrame);
 
   chart.on('click', function (params) {
-    if (params.dataIndex != null) {
-      updateFrame(params.dataIndex);
-    }
+    if (params.dataIndex != null) updateFrame(params.dataIndex);
   });
 }
 
@@ -256,11 +308,9 @@ function updateCursor(frameIdx) {
     updates.push({
       id: `s_${i}`,
       markLine: {
-        silent: true,
-        symbol: 'none',
+        silent: true, symbol: 'none',
         lineStyle: { color: '#ff4444', width: 1.5, type: 'dashed' },
-        data: [{ xAxis: frameIdx }],
-        label: { show: false },
+        data: [{ xAxis: frameIdx }], label: { show: false },
       },
     });
   });
@@ -270,11 +320,9 @@ function updateCursor(frameIdx) {
 function updateFrame(frameIdx) {
   if (frameIdx < 0 || frameIdx >= totalFrames) return;
   currentFrame = frameIdx;
-
   frameSlider.value = frameIdx;
   frameLabel.textContent = `${frameIdx} / ${totalFrames - 1}`;
 
-  // cameras
   cameraGrid.innerHTML = '';
   if (CAMERA_KEYS.length === 0) {
     cameraGrid.innerHTML = '<div class="placeholder-cam">No camera data</div>';
@@ -287,14 +335,12 @@ function updateFrame(frameIdx) {
       label.textContent = cameraLabel(cam);
       box.appendChild(label);
       const img = document.createElement('img');
-      img.src = `/api/frame/${currentEpisode}/${frameIdx}?camera=${cam}&t=${Date.now()}`;
+      img.src = `/api/frame/${currentEpisode}/${frameIdx}?camera=${cam}&ds=${currentDs}&t=${Date.now()}`;
       img.alt = cam;
       box.appendChild(img);
       cameraGrid.appendChild(box);
     });
   }
-
-  // chart cursor
   updateCursor(frameIdx);
 }
 
@@ -314,7 +360,6 @@ function togglePlay() {
       let next = currentFrame + 1;
       if (next >= totalFrames) next = 0;
       updateFrame(next);
-      // sync slider
       frameSlider.value = next;
     }, Math.round(1000 / speed));
   } else {
@@ -324,7 +369,6 @@ function togglePlay() {
 }
 playBtn.addEventListener('click', togglePlay);
 
-// stop playback when speed changes during play
 speedSelect.addEventListener('change', () => {
   if (isPlaying) {
     clearInterval(playTimer);
@@ -348,6 +392,9 @@ document.addEventListener('keydown', e => {
 
 // ── Resize ──
 window.addEventListener('resize', () => { if (chart) chart.resize(); });
+
+// ── Auto-load first dataset ──
+loadDataset(currentDs);
 </script>
 </body>
 </html>
